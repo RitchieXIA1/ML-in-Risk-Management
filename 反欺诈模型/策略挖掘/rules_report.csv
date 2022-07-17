@@ -1,0 +1,6 @@
+,rules,num_good,num_bad,bad_rate
+0,worst radius<=16.795 & worst concave points<=0.1358 & perimeter error<=3.016,2.0,296.0,0.9932885906040269
+1,worst radius<=16.795 & worst concave points<=0.1358 & perimeter error>3.016,3.0,32.0,0.9142857142857143
+2,worst radius<=16.795 & worst concave points>0.1358,28.0,18.0,0.391304347826087
+3,worst radius>16.795 & worst concave points<=0.1454,27.0,11.0,0.2894736842105263
+4,worst radius>16.795 & worst concave points>0.1454,152.0,0.0,0.0

@@ -1,0 +1,33 @@
+import pyhive
+from pyhive import hive
+import pandas as pd
+import key_one
+
+class LinkHive(object):
+    def __init__(self,host,port,username,password,database):
+        self.host = host
+        self.port = port
+        self.username = username
+        self.password = password
+        self.database = database
+
+    def __link(self):
+        self.conn = hive.Connection(host=self.host,
+                           port=10000,
+                           username=self.username,
+                           password=self.password,
+                           database=self.database,
+                           auth='CUSTOM')
+        # CUSTOM  LDAP
+    def selectdata(self,sql):
+        self.__link()
+
+        return  pd.read_sql(sql,self.conn)
+
+if __name__ == "__main__":
+
+    sql = "show tables"
+    result = LinkHive(host = key_one.host,port = key_one.port,username = key_one.username,
+                      password = key_one.password,database='da_bs').selectdata(sql)
+
+result

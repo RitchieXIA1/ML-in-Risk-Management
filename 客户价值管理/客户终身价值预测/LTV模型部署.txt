@@ -1,0 +1,782 @@
+----------核心CYD存量客户LTV取数及计算脚本设计思路（部署）----------
+----------20220704----------
+
+----------数据目录----------
+
+--------1、基础数据Basicdata（共计11个字段）--------
+----1.1字段明细----
+--1.1.1.id_number
+--1.1.2.sx_date
+--1.1.3.credit_limit_latest
+--1.1.4.mat_before
+--1.1.5.bal_cum_before
+--1.1.6.interest_ave _before
+--1.1.7.max_monthes_to_end
+--1.1.8.stat_month
+--1.1.9.age
+--1.1.10.score
+--1.1.11.if_ychb--
+------1.2中间表明细------
+--1.2.1fxb.ly_ltv_cyd_basicdata1
+--1.2.2fxb.ly_ltv_cyd_basicdata2--
+
+--------2、模型数据--------
+
+------2.1损失模型（模型变量1、基础数据已包含）------
+----2.1.1字段明细----
+--2.1.1.1.bal_cum_before
+--2.1.1.2.credit_limit_latest--
+----2.1.2中间表明细（无）----
+
+------2.2日均余额模型------
+----2.2.1字段明细----
+--2.2.1.1.loan_tpay_amt_1st
+--2.2.1.2.uncleared_cnt
+--2.2.1.3.inte_repay_12m
+--2.2.1.4.loan_6m_apply_prds
+--2.2.1.5.inte_repay_3m
+--2.2.1.6.loan_interest_incom
+--2.2.1.7.loan_3m_amt
+--2.2.1.8.coll_in_his_times
+--2.2.1.9.loan_3m_credit_times
+--2.2.1.10.bal_plan_ave_cust--
+----2.2.2中间表明细----
+--2.2.2.1fxb.ly_ltv_cyd_modeldata1--
+
+
+------2.3无余额用款概率模型------
+----2.3.1字段明细----
+--2.3.1.1.score
+--2.3.1.2.credit_limit_latest
+--2.3.1.3.loan_1y_apply_prds
+--2.3.1.4.last_loan_months
+--2.3.1.5.loan_payed_terms
+--2.3.1.6.age
+--2.3.1.7.overdue_days_max
+----2.3.2中间表明细----
+--2.3.2.1fxb.ly_ltv_cyd_modeldata2
+
+
+
+------2.4模型数据输出结果------
+--2.4.1.1fxb.ly_ltv_cyd_modeldata3--
+
+
+--------3、参数数据--------
+------3.1APR参数------
+------3.2PD参数------
+------3.3催收成本参数------
+----3.3.1字段明细----
+--3.1.1.1. para_rp_wtd_apr
+--3.2.1.1. para_pd
+--3.2.1.2. para_pd_adj
+--3.3.1.1. para_coll_fee
+----3.3.2中间表明细----
+--3.3.2.1.fxb.cust_ltv_para--
+
+--------4、结果输出--------
+----fxb.cust_ltv（其他代码检查无误后完善）----
+--待补充--
+
+
+
+--版本号：2022年3月初版V1.0--
+--作者：李扬--
+--核验：--
+
+
+
+
+
+
+
+
+--------LTV核心CYD切片样本、基础数据、行为数据--------
+--------LTV核心CYD切片样本、基础数据、行为数据--------
+
+
+
+--SELECT SYSDATE INTO SYS_DATE FROM SYSTEM.DUAL;  --【ZXL:全局宏变量的用法？】
+SELECT SYSDATE
+	,add_months(SYSDATE,-1)
+	,trunc(add_months(SYSDATE,-1),'MM')
+	,last_day(add_months(SYSDATE,-1))
+from system.dual;
+----DATE_ADD(SYS_DATE,-1)每月初执行上月末结果,注意所需查询的各张表的跑批结束时间----
+
+
+
+----basicdata1——核心CYD客户证件号、loanid、首次授信时间、最新额度、当前余额、当前最大逾期期数、平均利率、贷款到期日距今最大月份数数据----
+
+DROP TABLE IF EXISTS fxb.ly_ltv_cyd_basicdata1;
+CREATE TABLE fxb.ly_ltv_cyd_basicdata1 AS
+--A基础数据主表，取核心CYD客户（不包括logo='0301'产品，此产品2020年起已无新增申请）基本信息：id_number、loanid、首次授信时间数据
+--B切片时点最新额度表，生产部署直接取sda.v_s_cust_product最新额度
+--C当前余额（正常余额+核销余额）、逾期期数表、平均利率（新增待执行）、贷款到期日距今最大月份数表（可以为负值）--
+SELECT    A.id_number
+         ,A.id_number_r
+         ,A.loanid
+         ,A.sx_date
+         ,coalesce(B.credit_limit,b2.credit_limit_child,0)/100 AS credit_limit_latest --【优先取主表额度，再取子产品额度 ，用 0 填充 NULL】
+         ,C.bal_cum_before
+         ,C.mat_before
+         ,C.interest_ave_before
+		 ,C.max_monthes_to_end
+         --,trunc(DATE_ADD(SYS_DATE,-1),'MM') AS stat_month     --日期--
+		 ,trunc(add_months(SYSDATE,-1),'MM') AS stat_month     --日期--
+FROM 
+--A基础数据主表（授信通过客户名单）--
+	(SELECT *
+	FROM 
+		(SELECT   id_number
+		         ,id_number_r
+			     ,loanid
+--			     ,channel_code
+			     ,final_decision_effective_date AS sx_date	
+			     ,ROW_NUMBER() OVER (PARTITION BY id_number ORDER BY FINAL_DECISION_EFFECTIVE_DATE ASC) AS row_no1
+	    FROM risk_dm.customer_label
+		WHERE    ORG_CODE = '301'
+		       AND open_type = '核心'
+		       AND logo in ('PLON') 
+	           AND logo_trans='核心CYD'
+		       AND apply_type in('1','2')
+		       AND final_decision='OK'
+			   AND final_decision_effective_date<=last_day(add_months(SYSDATE,-1))    --日期--
+		       AND APP_RECOMM_BRANCH NOT IN ('7201','7101'))
+	 WHERE row_no1=1)     A    /*首次授信*/
+LEFT JOIN 
+--B,B2最新额度表--
+	(SELECT  id_number,credit_limit
+	 FROM    SDA.v_S_CUST_PRODUCT
+	 WHERE   product_logo='900'
+	       AND org_code='301'
+	       AND credit_limit IS NOT NULL --【关注下面0额度】
+		   AND trunc(date_update,'DD')<=trunc(SYSDATE,'DD'))     B     --日期--,--不取最新额度，部分客户额度可能缺失（log日志表2017年及以前数据不全）-- 【看记录每天都有大量更新，就取最新额度吧】【2022-05-07修正trunc】
+ON A.id_number=B.id_number
+--B2 product_child 核心诚易贷有些子场景会把额度落在child（创新客户额度存在product_child里面？？？） ???   
+LEFT JOIN 
+	(SELECT id_number,max(credit_limit) AS credit_limit_child
+	 FROM sda.v_S_CUST_PRODUCT_CHILD 
+	 WHERE    product_type IN ('0303','0304','0305') -- 【PLON子产品 ，子产品有冲突，不可以同时申请，保险起见取个大值】
+	 	    AND org_code = '301'
+	 GROUP BY id_number)     B2 
+ON A.id_number=B2.id_number
+--C当前余额（正常余额+核销余额）、逾期期数、平均利率（新增待执行）、贷款到期日距今最大月份数表（可以为负值）表--
+LEFT JOIN 
+	(SELECT   id_number
+	         ,sum(tbal) AS bal_cum_before
+	         ,max(actureterm) AS mat_before
+			 ,round(sum(coalesce(tbal,0)*coalesce(int_rate,0))/sum(coalesce(tbal,0)),2) AS interest_ave_before
+             --,round(max(months_between(enddate,trunc(DATE_ADD(SYS_DATE,-1),'DD'))),2) as max_monthes_to_end
+			 ,round(max(months_between(enddate,last_day(add_months(SYSDATE,-1)))),2) as max_monthes_to_end
+	FROM 
+		(SELECT  loanacno,loanid,id_number,enddate,int_rate
+		FROM sda.v_s_pl_loan_acc
+		WHERE    org_code='301'
+		       AND bankid='0106'
+			   AND open_type='核心'
+			   AND begindate<=last_day(add_months(SYSDATE,-1))) t1  --日期--
+	LEFT JOIN     --限制logo=plon--
+    	(SELECT loanid,logo 
+        FROM risk_dm.customer_label 
+        WHERE    ORG_CODE = '301'
+		       AND open_type = '核心'
+	           AND logo_trans='核心CYD'
+		       AND final_decision='OK'
+		       --AND final_decision_effective_date<=trunc(DATE_ADD(SYS_DATE,-1),'DD')  --日期--
+			   AND final_decision_effective_date<=last_day(add_months(SYSDATE,-1))  --日期--
+		       AND APP_RECOMM_BRANCH NOT IN ('7201','7101')  )  t2
+	on t1.loanid = t2.loanid
+	LEFT JOIN 
+		(SELECT   loanacno
+		         ,(bal+fbal) as tbal
+		         ,actureterm
+		FROM risk_dm.loan_all
+		--WHERE STAT_MONTH=trunc(DATE_ADD(SYS_DATE,-1),'MM'))  t3  --日期--
+		WHERE STAT_MONTH=trunc(add_months(SYSDATE,-1),'MM')  )  t3  --日期--
+	ON t1.loanacno=t3.loanacno
+    WHERE logo='PLON'
+	GROUP BY id_number) C
+ON A.id_number=md5(C.id_number);  --【pl_loan_acc 表的id_number_r有缺失】
+--【额度表有10%缺失，需调查原因，是不是正常调额】
+
+
+--check
+SELECT * FROM  ly_ltv_cyd_basicdata1 LIMIT 100;
+--【重要check】
+select case when credit_limit_latest=0 then '0' else 'BT-0' end  as flag ,count(*) as nbr from ly_ltv_cyd_basicdata1 group by flag;  
+--0  26233 BT-0	455020
+SELECT round(interest_ave_before,1),count(*) FROM ly_ltv_cyd_basicdata1 WHERE interest_ave_before IS NOT NULL  GROUP by round(interest_ave_before,1);
+
+
+
+----basicdata2——核心CYD客户年龄、是否重组、是否一次还本、统计月前一月人行分、统计月前一月评级数据----
+--B重组数据表取自：ltt_project_risk--
+--C是否一次还本表关于一次还本的认定标准：客户当前存在一次还本还款方式的贷款，且余额>0--
+DROP TABLE IF EXISTS fxb.ly_ltv_cyd_basicdata2;
+CREATE TABLE fxb.ly_ltv_cyd_basicdata2 AS
+SELECT   A.*
+        ,round(datediff(last_day(stat_month),to_date(substr(id_number_r,7,4)||"-"||substr(id_number_r,11,2)||"-"||substr(id_number_r,13,2)))/365,2) AS age
+        ,CASE WHEN B.id_number IS NOT NULL THEN 1 ELSE 0 END AS if_cz 
+        ,CASE WHEN C.id_number IS NOT NULL THEN 1 ELSE 0 END AS if_ychb
+        ,D.score
+        ,D.score_date
+        ,E.rating
+        ,E.rating_month
+FROM fxb.ly_ltv_cyd_basicdata1  A
+--B是否重组表--
+LEFT JOIN 
+    (SELECT DISTINCT id_number FROM ltt_project_risk WHERE flag LIKE '%重组%')  B
+ON A.id_number=B.id_number
+--C是否一次还本表--
+LEFT JOIN 
+	(SELECT DISTINCT id_number
+	FROM 
+	    (SELECT loanacno,loanid,id_number 
+	    FROM risk_dm.loan_acc 
+	    WHERE  PAYMENT_CODE IN ('11') 
+			   AND begindate<=last_day(add_months(SYSDATE,-1))     --日期--
+	           AND org_code='301' 
+	           AND bankid='0106' 
+	           AND logo_trans='核心CYD')     t1
+	LEFT JOIN 
+	    (SELECT loanid,logo 
+        FROM risk_dm.customer_label 
+        WHERE  ORG_CODE = '301'
+		       AND open_type = '核心'
+	           AND logo_trans='核心CYD'
+		       AND final_decision='OK'
+			   AND final_decision_effective_date<=last_day(add_months(SYSDATE,-1))     --日期--
+		       AND APP_RECOMM_BRANCH NOT IN ('7201','7101'))  t2
+        ON t1.loanid=t2.loanid
+	LEFT JOIN 
+		(SELECT loanacno,loanid,(bal+fbal) AS tbal
+		FROM risk_dm.loan_all 
+		WHERE  (bal+fbal)>0
+			   AND stat_month=trunc(add_months(SYSDATE,-1),'MM'))  t3     --日期--
+	ON t1.loanacno=t3.loanacno
+	WHERE  tbal>0
+	       AND logo='PLON')  C
+ON A.id_number=C.id_number
+--D-score数据表（与rating_month保持一致）--
+LEFT JOIN
+	(SELECT * 
+	FROM 
+	    (SELECT   id_number
+	             ,score_date
+	             ,score 
+	             ,ROW_NUMBER() OVER(PARTITION BY id_number ORDER BY last_update_date DESC) AS row_no
+	    FROM sda.s_pboc_score
+	    WHERE score_date=last_day(add_months(SYSDATE,-2)))     --日期(新调整待验证)--
+	WHERE row_no=1)  D
+ON A.id_number=md5(D.id_number)
+--E&F-rating数据，以fxb.wl_cust_rating_final为准（生产部署不需要F表）--
+LEFT JOIN 
+    (SELECT   owner_id_number
+             ,rating
+             ,rating_month
+    FROM sda.S_RISK_CUST_RATING
+--跑批日期月份数-2取年月生成字符串--
+	WHERE rating_month=TO_CHAR(EXTRACT(YEAR FROM ADD_MONTHS(SYSDATE,-2))||lpad(EXTRACT(MONTH FROM ADD_MONTHS(SYSDATE,-2)),2,0)))  E 	--日期--
+ON A.id_number_r=E.owner_id_number
+;
+
+--check
+SELECT * FROM fxb.ly_ltv_cyd_basicdata2 LIMIT 100;
+--【重要CHECK 排除在LTB 之外的客户】
+SELECT count(*),sum(CASE WHEN id_number_r IS NULL OR credit_limit_latest =0 OR credit_limit_latest IS NULL OR rating='F' THEN 1 ELSE 0 end) AS to_del
+	,sum(CASE WHEN id_number_r IS NULL THEN 1 ELSE 0 end) AS id_null
+	,sum(CASE WHEN credit_limit_latest =0 OR credit_limit_latest IS NULL  THEN 1 ELSE 0 end) AS crt_0
+	,sum(CASE WHEN rating='F' THEN 1 ELSE 0 end) AS rating_f
+FROM ly_ltv_cyd_basicdata2;
+--481253	44693	56	26233	26748
+
+SELECT  if_ychb,count(*)  FROM ly_ltv_cyd_basicdata2 WHERE bal_cum_before >0 GROUP by if_ychb  ;
+SELECT  rating,count(*)  FROM ly_ltv_cyd_basicdata2 WHERE sx_date <'2022-03-01' GROUP by rating  ;
+
+
+
+
+--模型中间表——还款计划表--
+DROP TABLE fxb.ly_ltv_cyd_modeldata_middle1;
+CREATE TABLE fxb.ly_ltv_cyd_modeldata_middle1 AS
+SELECT   id_number
+        ,sum(bal_plan_ave_loan) AS bal_plan_ave_cust
+--        ,to_date('2020-01-01') AS stat_month     --日期--
+FROM 
+--计算单笔合同的未来2年的计划日均余额
+--未来2年统一按730天计算--
+	(SELECT  loanacno
+	        ,id_number
+	        ,round(max(bal_bet_cum)/730,0) AS bal_plan_ave_loan
+	FROM 
+--计算每期账单的占用天数
+--计算每期账单的占用本金总额
+--累加每期账单的占用本金总额--
+		(SELECT   *
+		         ,datediff(due_date_adj,start_date_adj) AS days_bet
+		         ,current_balance_adj*datediff(due_date_adj,start_date_adj) AS bal_bet
+		         ,sum(current_balance_adj*datediff(due_date_adj,start_date_adj))over(PARTITION BY loanacno ORDER BY seq) AS bal_bet_cum
+		FROM 
+--补全start_date;
+--处理余额统计首期和尾期的起始'2020-01-31'和结束时间'2022-01-31';
+--生成当期剩余本金--
+			(SELECT   *
+--			         ,CASE WHEN START_date<=trunc(DATE_ADD(SYS_DATE,-1),'DD') THEN trunc(DATE_ADD(SYS_DATE,-1),'DD')     --日期--
+--			               WHEN START_date IS NULL AND ADD_MONTHS(due_date,-1)<=trunc(DATE_ADD(SYS_DATE,-1),'DD') THEN trunc(DATE_ADD(SYS_DATE,-1),'DD')     --日期--
+--			               WHEN START_date IS NULL THEN ADD_MONTHS(due_date,-1) 
+--			               ELSE START_date END 
+--			          AS start_date_adj
+--			         ,CASE WHEN due_date>=trunc(ADD_MONTHS(DATE_ADD(SYS_DATE,-1),24),'DD') THEN trunc(ADD_MONTHS(DATE_ADD(SYS_DATE,-1),24),'DD')     --日期--
+--			               ELSE due_date END 
+--			          AS due_date_adj
+			         ,CASE WHEN START_date <=last_day(add_months(SYSDATE,-1)) THEN last_day(add_months(SYSDATE,-1))     --日期--
+			               WHEN START_date IS NULL AND ADD_MONTHS(due_date,-1)<=last_day(add_months(SYSDATE,-1)) THEN last_day(add_months(SYSDATE,-1))     --日期--
+			               WHEN START_date IS NULL THEN ADD_MONTHS(due_date,-1) 
+			               ELSE START_date END 
+			          AS start_date_adj
+			         ,CASE WHEN due_date>=trunc(ADD_MONTHS(last_day(add_months(SYSDATE,-1)),24),'DD') THEN trunc(ADD_MONTHS(last_day(add_months(SYSDATE,-1)),24),'DD')     --日期--
+			               ELSE due_date END 
+			          AS due_date_adj
+			         ,(current_balance+principal_due) AS current_balance_adj
+			FROM  
+----planpay还款计划基础数据取数开始----
+                (SELECT B.*,A.id_number 
+				FROM
+--1.取出核心CYD的合同编号loanacno,id_number--
+				    (SELECT t1.loanacno,t1.id_number 
+				    FROM 
+						(SELECT  loanacno,id_number,loanid
+						FROM  risk_dm.loan_acc
+						WHERE    org_code='301'
+					           AND bankid='0106'
+					           AND logo_trans='核心CYD'
+					           --AND begindate<=trunc(DATE_ADD(SYS_DATE,-1),'DD'))     t1     --日期--  
+							   AND begindate<=last_day(add_months(SYSDATE,-1)))     t1     --日期-- 
+				    LEFT JOIN
+				        (SELECT loanid,logo 
+				        FROM risk_dm.customer_label 
+				        WHERE    ORG_CODE = '301'
+						       AND open_type = '核心'
+					           AND logo_trans='核心CYD'
+						       AND final_decision='OK'
+						       --AND final_decision_effective_date<=trunc(DATE_ADD(SYS_DATE,-1),'DD')     --日期--
+							   AND final_decision_effective_date<=last_day(add_months(SYSDATE,-1))     --日期--
+						       AND APP_RECOMM_BRANCH NOT IN ('7201','7101'))     t2
+				    ON t1.loanid=t2.loanid
+				    WHERE t2.logo='PLON')     A
+				LEFT JOIN 
+--2.关联还款计划表基础数据，计算计划日均余额时间区间'2020-02-01'至'2022-01-31'--
+--因为start_date有缺失，需要加工补全--
+					(select   loanacno
+					         ,seq
+					         ,loan_start_date
+					         ,due_date 
+					         ,principal_due
+					         ,current_balance
+					         ,start_date
+					 FROM sda.v_s_pl_schedule
+					 WHERE    org_code = '301'
+				            --AND loan_start_date<=trunc(DATE_ADD(SYS_DATE,-1),'DD')     --日期--
+				            --AND due_date>=trunc(SYS_DATE,'DD')     --日期--
+				            --AND due_date<=trunc(last_day(ADD_MONTHS(SYS_DATE,24)),'DD'))      B     --日期--
+				            AND loan_start_date<=last_day(add_months(SYSDATE,-1))     --日期--
+				            AND due_date>=trunc(SYSDATE,'DD')     --日期--  【2022-05-07修正trunc】
+				            AND due_date<=last_day(ADD_MONTHS(SYSDATE,24)))      B     --日期--
+				ON A.loanacno=B.loanacno 
+				WHERE B.loanacno IS NOT NULL )    planpay
+--还款计划基础数据取数完成--
+			ORDER BY loanacno,seq)
+		ORDER BY loanacno,seq)  --【这步ORDER 是否有必要？】
+	GROUP BY loanacno,id_number)
+GROUP BY id_number
+;
+
+--check
+SELECT * FROM ly_ltv_cyd_modeldata_middle1 LIMIT 200;
+SELECT CASE WHEN bal_plan_ave_cust IS NULL THEN 'NULL'
+ WHEN bal_plan_ave_cust=0 THEN '0'
+ ELSE '>0' END AS flag,count(*) FROM ly_ltv_cyd_modeldata_middle1 group BY flag;
+
+
+----modeldata1——核心CYD有余额客户行为数据（日均余额预测模型）、还款计划表日均余额数据表----
+DROP TABLE IF EXISTS fxb.ly_ltv_cyd_modeldata1;
+CREATE TABLE fxb.ly_ltv_cyd_modeldata1 AS
+SELECT   A.*
+		,B.loan_tpay_amt_1st
+		,B.uncleared_cnt
+		,B.inte_repay_12m
+		,B.loan_6m_apply_prds
+		,B.inte_repay_3m
+		,B.loan_interest_incom
+		,B.loan_3m_amt
+		,B.coll_in_his_times
+		,B.loan_3m_credit_times
+		,C.bal_plan_ave_cust
+FROM fxb.ly_ltv_cyd_basicdata2     A
+--B有余额客户行为数据表--
+LEFT JOIN  
+    (SELECT   id_number
+             ,loan_tpay_amt_1st
+			 ,uncleared_cnt
+			 ,inte_repay_12m
+			 ,loan_6m_apply_prds
+			 ,inte_repay_3m
+			 ,loan_interest_incom
+			 ,loan_3m_amt
+			 ,coll_in_his_times
+			 ,loan_3m_credit_times
+    FROM risk_dm.m_cust_behave_info
+    --WHERE STAT_MONTH=trunc(DATE_ADD(SYS_DATE,-1),'MM'))     B     --日期-- 
+	WHERE STAT_MONTH=trunc(add_months(SYSDATE,-1),'MM'))     B     --日期-- 
+ON A.id_number=B.id_number 
+--C还款计划表日均余额数据表--
+LEFT JOIN fxb.ly_ltv_cyd_modeldata_middle1     C
+ON A.id_number=C.id_number
+;
+--check
+SELECT * FROM ly_ltv_cyd_modeldata1 LIMIT 100;
+SELECT * FROM ly_ltv_cyd_modeldata1 WHERE bal_cum_before >0 LIMIT 100;
+
+
+
+--modeldata2核心CYD无余额客户行为变量——loan_1y_apply_prds、last_loan_months、overdue_days_max、LOAN_PAYED_TERMS--
+--行为特征数据不计入rf业务（IS_RISK_FREE=0）--
+--疑问--申请过rf没申请过非rf为0，没任何申请为null--
+DROP TABLE IF EXISTS  fxb.ly_ltv_cyd_modeldata2;
+CREATE TABLE fxb.ly_ltv_cyd_modeldata2 AS
+SELECT   A.*
+        ,CASE WHEN b.num1 IS NOT NULL THEN num1
+              WHEN c.id_number IS NULL THEN NULL 
+              ELSE 0 END 
+         AS LOAN_1Y_APPLY_PRDS
+        ,d.last_loan_months
+        ,e.overdue_days_max
+        ,f.LOAN_PAYED_TERMS
+FROM fxb.ly_ltv_cyd_modeldata1     A
+--loan_1y_apply_prds--
+LEFT JOIN 
+    (SELECT   id_number,count(DISTINCT source_flag) AS num1
+    FROM risk_dm.customer_label
+    WHERE    ORG_CODE = '301'
+	       AND APP_RECOMM_BRANCH NOT IN ('7201','7101')
+	       AND IS_RISK_FREE=0
+	       --AND MONTHS_BETWEEN(trunc(DATE_ADD(SYS_DATE,-1),'MM') ,trunc(apply_date,'MM')) BETWEEN 0 AND 11     --日期--
+		   AND MONTHS_BETWEEN(trunc(add_months(SYSDATE,-1),'MM') ,trunc(apply_date,'MM')) BETWEEN 0 AND 11     --日期--
+	GROUP BY id_number)     B
+ON a.id_number=b.id_number
+LEFT JOIN 
+    (SELECT distinct id_number 
+	 FROM risk_dm.loan_acc 
+	 --WHERE begindate<=trunc(DATE_ADD(SYS_DATE,-1),'DD')  )     C     --日期--
+	 WHERE begindate<=last_day(add_months(SYSDATE,-1))  )     C     --日期--
+ON a.id_number=c.id_number
+--last_loan_months--
+LEFT JOIN 
+    (SELECT id_number
+	       --,MIN(MONTHS_BETWEEN(trunc(DATE_ADD(SYS_DATE,-1),'MM'),trunc(begindate,'MM'))) AS last_loan_months     --日期--
+		   ,MIN(MONTHS_BETWEEN(trunc(add_months(SYSDATE,-1),'MM'),trunc(begindate,'MM'))) AS last_loan_months     --日期--
+	FROM risk_dm.loan_acc
+	WHERE    --begindate<=trunc(DATE_ADD(SYS_DATE,-1),'DD')     --日期--
+	       begindate<=last_day(add_months(SYSDATE,-1))
+	       AND IS_RISK_FREE=0
+	GROUP BY id_number)     D
+ON a.id_number=d.id_number
+--overdue_days_max（loan_all与loab_acc表关联用loanacno）--
+LEFT JOIN 
+	(SELECT   t1.id_number,max(MAXOVER_DAYS) AS overdue_days_max
+	FROM 
+	    (SELECT id_number FROM fxb.ly_ltv_cyd_modeldata1)     t1
+	LEFT JOIN 
+	    (SELECT id_number,loanacno,is_risk_free 
+		FROM risk_dm.loan_acc 
+		--WHERE begindate<=trunc(DATE_ADD(SYS_DATE,-1),'DD')  )     t2     --日期--
+		WHERE begindate<=last_day(add_months(SYSDATE,-1))  )     t2     --日期--
+	ON t1.id_number=t2.id_number
+	LEFT JOIN 
+		(SELECT   loanacno
+		         ,MAXOVER_DAYS
+		FROM risk_dm.loan_all
+		--WHERE stat_month=trunc(DATE_ADD(SYS_DATE,-1),'MM')  )     t3     --日期--
+		WHERE stat_month=trunc(add_months(SYSDATE,-1),'MM')  )     t3     --日期--
+	ON t2.loanacno=t3.loanacno
+	WHERE t2.is_risk_free=0
+	GROUP BY t1.id_number)     E
+ON a.id_number=e.id_number
+--LOAN_PAYED_TERMS--
+LEFT JOIN 
+	(SELECT ID_NUMBER
+		   ,STAT_MONTH
+		   ,SUM(CASE WHEN RANK=1 THEN NVL(PAY_TERM,0) ELSE 0 END) AS LOAN_PAYED_TERMS
+		   --,SYS_DATE AS CREATE_DATE 
+		   ,SYSDATE AS CREATE_DATE		   
+	FROM   
+		(SELECT AA.*
+			   ,BB.STAT_MONTH AS STAT_MONTHS
+			   ,SDATE,SCAPI,STERM,SINTE,LOANACNO
+			   ,CASE WHEN RDATE IS NULL OR RDATE>LAST_DAY THEN NULL ELSE RDATE END AS RDATE
+			   ,MAX(CASE WHEN PAYOFFDATE<=LAST_DAY AND OVERBEGINDATE IS NULL THEN TTERM 
+			             WHEN (RDATE<=LAST_DAY OR ((OVERBEGINDATE IS NULL OR OVERBEGINDATE>SDATE) AND RDATE IS NULL)) THEN STERM 
+						 ELSE 0 END
+					) OVER(PARTITION BY AA.ID_NUMBER,AA.STAT_MONTH,LOANACNO) AS PAY_TERM
+			   ,RANK() OVER(PARTITION BY AA.ID_NUMBER,AA.STAT_MONTH,LOANACNO ORDER BY SDATE) AS RANK
+		FROM 
+			(SELECT ID_NUMBER
+			       --,trunc(DATE_ADD(SYS_DATE,-1),'MM') AS stat_month
+			       --,trunc(DATE_ADD(SYS_DATE,-1),'DD') AS last_day 
+				   ,trunc(add_months(SYSDATE,-1),'MM') AS stat_month
+			       ,last_day(add_months(SYSDATE,-1)) AS last_day
+			 FROM fxb.ly_ltv_cyd_modeldata1) AA 
+		LEFT JOIN 
+			(SELECT ID_NUMBER,LOANACNO,TRUNC(SDATE,'MM') AS STAT_MONTH,STERM,SDATE,SCAPI,SINTE,RDATE,OVERBEGINDATE,PAYOFFDATE,TTERM 
+			 FROM RISK_DM.MIDDLE_TABLE_0_2 WHERE IS_RISK_FREE=0) BB  
+		ON AA.ID_NUMBER=BB.ID_NUMBER AND AA.STAT_MONTH>=BB.STAT_MONTH)
+   	GROUP BY ID_NUMBER,STAT_MONTH)     F
+ON a.id_number=f.id_number
+;
+--check
+select * from ly_ltv_cyd_modeldata2 limit 100;
+
+
+--生成预计损失金额pre_default、无余额客户用款概率pre_rp_rate、日均余额预测值pre_bal--
+DROP TABLE IF EXISTS fxb.ly_ltv_cyd_modeldata3;
+CREATE TABLE fxb.ly_ltv_cyd_modeldata3 AS
+SELECT   *
+        ,CASE WHEN mat_before>0 THEN bal_cum_before
+		      WHEN if_ychb=1 THEN round((0.75728*bal_cum_before+9303.36968),2)
+			  WHEN nvl(bal_cum_before,0)=0 THEN round((0.81997*credit_limit_latest+1506.0221),2)  --【bal_cum_before 可能为NULL】
+		      WHEN nvl(bal_cum_before,0)>0 THEN round((0.79607*bal_cum_before-2950.87737),2)
+			  ELSE NULL END AS pre_default
+        ,CASE WHEN nvl(bal_cum_before,0)=0
+              THEN   1/(exp(((sc_credit_limit_latest
+                    +sc_score
+                    +sc_age
+                    +sc_last_loan_months
+                    +sc_loan_1y_apply_prds
+                    +sc_overdue_days_max
+                    +sc_loan_payed_terms)-470.3422)/43.2809)+1)
+              ELSE NULL END AS pre_rp_rate
+        ,CASE WHEN nvl(bal_cum_before,0)>0 AND if_ychb=0
+	          THEN (0.89*nvl(bal_plan_ave_cust,0)
+	               + 0.13*nvl(loan_tpay_amt_1st ,0)
+	               + 6409.37*nvl(uncleared_cnt ,0)
+	               + 0.86*nvl(inte_repay_12m ,0)
+	               + 7517.43*nvl(loan_6m_apply_prds,0)
+	               - 7684.82)
+	          WHEN nvl(bal_cum_before,0)>0 AND if_ychb=1
+	          THEN (0.6047*nvl(bal_plan_ave_cust,0) 
+	               + 10.0869*nvl(inte_repay_3m,0) 
+	               + 0.4726*nvl(loan_interest_incom,0) 
+	               + 0.0751*nvl(loan_3m_amt,0) 
+	               - 3978.506*nvl(coll_in_his_times,0) 
+	               + 11480*nvl(loan_3m_credit_times,0)
+	               + 25790)
+	          WHEN nvl(bal_cum_before,0)=0
+	          THEN (0.373*credit_limit_latest
+	               + 13171)
+	     END AS pre_bal 
+FROM 
+	(SELECT   *
+			 ,CASE WHEN credit_limit_latest <=49000  THEN 119 
+			       ELSE 78 END AS sc_credit_limit_latest
+			 ,CASE WHEN score IS NULL THEN 48
+			       WHEN score <=262  THEN 184 
+			       WHEN score <=696  THEN 113 
+	 	 	  	   WHEN score <=835  THEN 48 
+			       WHEN score <=861  THEN 59 
+			       WHEN score <=893  THEN 73 
+		 	       ELSE 102 END AS sc_score
+		 	 ,CASE WHEN age IS NULL  THEN 73
+			       WHEN age <=34.23  THEN 73 
+			       WHEN age <=46.85  THEN 78 
+			       ELSE 90 END AS sc_age
+			 ,CASE WHEN last_loan_months IS NULL THEN 87
+			       WHEN last_loan_months <=17  THEN 57 
+			       WHEN last_loan_months <=28  THEN 67 
+			       WHEN last_loan_months <=40  THEN 75 
+			       ELSE 87 END AS sc_last_loan_months
+			 ,CASE WHEN loan_1y_apply_prds IS NULL THEN 87
+			       WHEN loan_1y_apply_prds =0  THEN 82 
+			       ELSE 55 END AS sc_loan_1y_apply_prds
+			 ,CASE WHEN overdue_days_max IS NULL  THEN 83
+			       WHEN overdue_days_max =0  THEN 78 
+			       WHEN overdue_days_max <=3  THEN 74 
+			       ELSE 82 END AS sc_overdue_days_max
+			 ,CASE WHEN loan_payed_terms IS NULL  THEN 86
+			       WHEN loan_payed_terms <=9  THEN 90 
+			       WHEN loan_payed_terms <=48  THEN 78 
+			       ELSE 67 END AS sc_loan_payed_terms
+	FROM fxb.ly_ltv_cyd_modeldata2
+	--【排除条件】有额度； 评级不为F； 身份证不缺失
+	WHERE credit_limit_latest >0 
+		AND (trim(rating) <>'F' OR rating IS NULL)
+		AND id_number_r IS NOT null
+	)
+;
+--check
+select * from ly_ltv_cyd_modeldata3 limit 180;
+--null check
+SELECT sum(CASE WHEN pre_bal IS NULL THEN 1 ELSE 0 END) FROM ly_ltv_cyd_modeldata3;  -- 0 
+
+
+
+----output1——LTV计算结果输出----
+--para_version条件待生成存储过程参数—
+-- round((0.373*credit_limit_latest+13171),4)作用是什么？--  【防止 浮点小数超长引起计算和显示错误】
+--SELECT * FROM fxb.cust_ltv_para;
+
+DROP TABLE if EXISTS fxb.ly_ltv_cyd_output1;
+CREATE TABLE fxb.ly_ltv_cyd_output1 AS
+SELECT   *
+        ,CASE WHEN nvl(bal_cum_before,0)<=0 THEN round((1 - para_pd)*(0.373*credit_limit_latest+13171),4)*round(para_rp_wtd_apr,4)*2  --两年利息收入 *2
+			  WHEN nvl(bal_cum_before,0)>0 THEN round((1 - para_pd* para_pd_adj),4) 
+				* round(((CASE WHEN nvl(pre_bal,0) > bal_plan_ave_cust THEN bal_plan_ave_cust ELSE nvl(pre_bal,0) end)* interest_ave_before *2/100 
+					+ (CASE WHEN nvl(pre_bal,0) > bal_plan_ave_cust THEN nvl(pre_bal,0) - bal_plan_ave_cust ELSE 0 end)*round(para_rp_wtd_apr,4)*2 ),2) 
+				--bal_predict plan_bal 取小/ bal diff 避免可能出现的负值
+			  ELSE 0.9999
+			  END AS pre_inte
+	-- risk cost
+		,CASE WHEN cust_label IS NOT NULL THEN round(para_pd*para_pd_adj,4) * pre_default
+			  ELSE 0.9999
+			  END AS pre_risk_cost
+	-- coll cost(完成)
+		,CASE WHEN nvl(bal_cum_before,0)<=0 THEN para_coll_fee* credit_limit_latest
+			  WHEN nvl(bal_cum_before,0)>0 THEN para_coll_fee* bal_cum_before
+			  ELSE 0.9999
+			  END AS pre_coll_fee
+	-- finance cost(完成)
+		,CASE WHEN nvl(bal_cum_before,0)<=0 THEN round((0.373*credit_limit_latest+13171)*0.040,4)
+			  WHEN nvl(bal_cum_before,0)>0 THEN round(coalesce(pre_bal,0)*0.040,4)
+			  ELSE 0.9999
+			  END AS pre_finace_cost
+FROM 
+--关联参数数据--
+	(SELECT   A.*
+			 ,B.para_coll_fee
+			 ,C.para_pd
+			 ,D.para_rp_wtd_apr
+			 ,nvl(E.para_pd_adj,1) AS para_pd_adj  --【匹配不上，就补填 1 ，防止缺失发生】
+	FROM 
+		(SELECT   *
+				 ,CASE WHEN nvl(bal_cum_before,0)=0 THEN '无余额'  -- 【有缺失】
+					   WHEN nvl(bal_cum_before,0)>0 AND if_ychb=1 THEN '有余额一次还本'
+					   ELSE '有余额非一次还本' 
+					   END AS cust_label
+		FROM fxb.ly_ltv_cyd_modeldata3)     A
+	--关联para_coll_fee--
+	LEFT JOIN 
+		(SELECT   cust_label
+				 ,value_control
+				 ,para_value AS para_coll_fee
+		FROM fxb.cust_ltv_para
+		WHERE    para_version='V202201'
+			   AND para_name='para_coll_fee')     B
+	ON trim(a.cust_label)=trim(b.cust_label) AND trim(nvl(a.rating,'NULL'))=trim(b.value_control)  --【 注意评级存在缺失 】 【用trim()函数删除字符左右的空格，上传文件容易发生空格补全的现象】
+	--关联para_pd--
+	LEFT JOIN 
+		(SELECT   cust_label
+				 ,value_control
+				 ,para_value AS para_pd
+		FROM fxb.cust_ltv_para
+		WHERE    para_version='V202201'
+			   AND para_name='para_pd')     C
+	ON trim(a.cust_label)=trim(c.cust_label) AND trim(nvl(a.rating,'NULL'))=trim(c.value_control)  --【 注意评级存在缺失 】
+	--关联para_rp_wtd_apr--
+	LEFT JOIN 
+		(SELECT   value_control
+				 ,para_value AS para_rp_wtd_apr
+		FROM fxb.cust_ltv_para
+		WHERE    para_version='V202201'
+			   AND para_name='para_rp_wtd_apr')     D
+	ON trim(nvl(a.rating,'NULL'))=trim(d.value_control)
+--关联para_pd_adj--
+-- fxb.cust_ltv_para待补全--
+	LEFT JOIN 
+		(SELECT   cust_label
+				,value_control
+				,para_value AS para_pd_adj
+		FROM fxb.cust_ltv_para
+		WHERE    para_version='V202201'
+			   AND para_name='para_pd_adj')     E
+	ON trim((case when a.max_monthes_to_end <=6 then '6'
+		     when a.max_monthes_to_end <=12 then '12'
+			 when a.max_monthes_to_end <=18 then '18'
+			 when a.max_monthes_to_end <=24 then '24'
+			 when a.max_monthes_to_end <=36 then '36'
+			 when a.max_monthes_to_end <=48 then '48'
+			 else '48' end))
+		=trim(e.value_control) AND trim(a.cust_label)= trim(e.cust_label)  )
+;
+--check
+select  *  from  ly_ltv_cyd_output1 limit 180;
+--NULL CHECK
+SELECT sum(CASE WHEN para_coll_fee IS NULL THEN 1 ELSE 0 END ) AS para_coll_fee_null
+,sum(CASE WHEN para_pd IS NULL THEN 1 ELSE 0 END ) AS para_pd_null
+,sum(CASE WHEN para_rp_wtd_apr IS NULL THEN 1 ELSE 0 END ) AS para_rp_wtd_apr_null
+,sum(CASE WHEN para_pd_adj IS NULL THEN 1 ELSE 0 END ) AS para_pd_adj_null
+FROM ly_ltv_cyd_output1;
+--  0 0 0 0
+
+
+-- Final 
+DROP TABLE if EXISTS fxb.ly_ltv_cyd_output_final;
+CREATE TABLE fxb.ly_ltv_cyd_output_final AS
+SELECT *
+,CASE WHEN nvl(ltv,0) <= 1500 THEN "V1"
+      WHEN nvl(ltv,0) <= 8000 THEN "V2"
+      WHEN nvl(ltv,0) >  8000 THEN "V3"
+      ELSE "ELSE"
+      END AS ltv_label
+,CASE WHEN nvl(ltv,0) <= 1500 THEN "鑫之诚"
+      WHEN nvl(ltv,0) <= 8000 THEN "梦之诚"
+      WHEN nvl(ltv,0) >  8000 THEN "享之诚"
+      ELSE "ELSE"
+      END AS ltv_title
+,last_day(add_months(SYSDATE,-1)) as ltv_date
+FROM (
+	SELECT id_number
+		,"核心CYD存量" as ltv_group
+		,sx_date
+		,loanid
+		,credit_limit_latest
+		,bal_cum_before
+		,mat_before
+		,interest_ave_before
+		,max_monthes_to_end
+		,stat_month
+		,if_cz
+		,if_ychb
+		,rating
+		,rating_month
+		,cust_label
+		,para_coll_fee
+		,para_pd
+		,para_rp_wtd_apr
+		,para_pd_adj
+	
+		,round(pre_rp_rate,4)   as pre_rp_rate
+		,round(pre_bal,2)       as pre_bal
+		,round(pre_inte,2)      as pre_inte
+		,round(pre_default,2)   as pre_default
+		,round(pre_risk_cost,2) as pre_risk_cost
+		,round(pre_coll_fee,2)  as pre_coll_fee
+		,round(pre_finace_cost,2) as pre_finace_cost
+		,round(CASE WHEN cust_label="无余额" 
+				  THEN round(pre_rp_rate,3)*(coalesce(pre_inte,0) - coalesce(pre_risk_cost,0) - coalesce(pre_coll_fee,0) - coalesce(pre_finace_cost,0) )
+		      WHEN cust_label IN ("有余额非一次还本","有余额一次还本 ") 
+		      	  THEN (coalesce(pre_inte,0) - coalesce(pre_risk_cost,0) - coalesce(pre_coll_fee,0) - coalesce(pre_finace_cost,0) )
+		      ELSE 0.9999
+		      END,2) AS LTV
+	FROM ly_ltv_cyd_output1 )
+;
+
+--check
+SELECT * FROM ly_ltv_cyd_output_final LIMIT 180;
+
+--stat
+SELECT cust_label,ltv_label,ltv_title,count(*) FROM ly_ltv_cyd_output_final GROUP BY cust_label,ltv_label,ltv_title;
+SELECT cust_label,MIN(CREDIT_LIMIT_LATEST) AS MIN ,MAX(CREDIT_LIMIT_LATEST) AS MAX FROM ly_ltv_cyd_output_final GROUP BY cust_label;
+
+
+
+-- E N D

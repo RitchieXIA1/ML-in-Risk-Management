@@ -1,0 +1,3 @@
+from geopy.distance import geodesic
+
+dis = geodesic((A_LAT,A_LON), (B_LAT,B_LON)).m
