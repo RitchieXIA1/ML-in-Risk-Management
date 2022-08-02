@@ -1,0 +1,8 @@
+大佬总结的图特征提取方向：
+1.node-level，做node ranking，比如betweeness，pagerank之类的
+2. community，对节点做聚类，聚类的label可以作为category features，每个community可以做groupby的聚合计算
+3.structure-level，结构特征，主要通过graph embedding的方式，比如node2vec，structure2vec之类的方式来做
+4.当然也可以用graphlets来做统计也ok
+5.最近邻特征，其实等价于无参数的gnn，一个节点的最近邻特征等于他的邻节点的特征的聚合
+https://zhuanlan.zhihu.com/p/535630640
+6.5 gnn无监督
